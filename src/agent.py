@@ -3,7 +3,6 @@ import inspect
 import time
 import httpx
 import json
-import os
 
 from typing import Any, Union, Mapping, Callable, get_origin, get_args
 
@@ -15,24 +14,31 @@ from openai.types.chat.chat_completion import ChatCompletion
 from loguru import logger as log
 
 
-class Misster(OpenAI):
+class Agent(OpenAI):
 
     _GHOSTED_FUNC_PREFIX = "unitialized_"
 
     _tools_list: list[dict[str, Any]] = []
 
     _names_to_functions: dict[str, functools.partial] = {}
+    
+    _name: str | None = None
 
-    _role: str = ""
-    """
-    What is his role as LLM? Describe it here.
-    """
+    _role: str | None = None
+    
+    _goal: str | None = None
+    
+    _backstory: str | None = None
 
     _context: list[dict[str, str]] = []
 
     def __init__(
         self,
         *,
+        name: str | None = None,
+        role: str,
+        goal: str,
+        backstory: str,
         api_key: str | None = None,
         organization: str | None = None,
         project: str | None = None,
@@ -56,6 +62,13 @@ class Misster(OpenAI):
         _strict_response_validation: bool = False,
     ) -> None:
 
+        self._name      = name
+        self._role      = role
+        self._goal      = goal
+        self._backstory = backstory
+
+        self.build_context()
+        
         super().__init__(
             api_key=api_key,
             organization=organization,
@@ -68,8 +81,159 @@ class Misster(OpenAI):
             http_client=http_client,
             _strict_response_validation=_strict_response_validation,
         )
-
+        
         return None
+
+
+    def build_context(self):
+        """
+        This function builds the context for the agent based on the role, goal, and backstory provided during initialization.
+        """
+
+        log.debug(f"Building context for agent {self._name}...")
+        log.debug(f"\tRole: {self._role}")
+        log.debug(f"\tGoal: {self._goal}")
+        log.debug(f"\tBackstory: {self._backstory}")
+
+        self._context.append({
+            "role": "system",
+            "content": "Your name is : " + self._name
+        })
+        self._context.append({
+            "role": "system",
+            "content": "Your role is : " + self._role
+        })
+        self._context.append({
+            "role": "system",
+            "content": "Your goal is : " + self._goal
+        })
+        self._context.append({
+            "role": "system",
+            "content": "Your backstory is : " + self._backstory
+        })
+        
+        log.debug(f"context : {self._context}")
+
+
+    def _simple_message(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        max_tokens: int | NotGiven = NOT_GIVEN,
+        stream: bool = False,
+        temperature = 0.8,
+    ) -> ChatCompletion:
+        """
+        Sends a message to the chat API without any tool calls.
+        
+        Args:
+            model (str): The model to use for the completion.
+            messages (list[dict[str, str]]): A list of messages to send to the chat API.
+            max_tokens (int): The maximum number of tokens to generate.
+            stream (bool): Whether to stream the response or wait for the completion.
+            temperature (float): The sampling temperature to use for the completion.
+
+        Returns:
+            ChatCompletion: The completion response from the chat API.
+        """
+
+        return self.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=stream,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+
+    def _tool_message(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        max_tokens: int | NotGiven = NOT_GIVEN,
+        stream: bool = False,
+        tool_choice=NOT_GIVEN,
+        temperature=0.8
+    ) -> ChatCompletion:
+        """
+        Sends a message to the chat API with a tool call.
+
+        Args:
+            model (str): The model to use for the completion.
+            messages (list[dict[str, str]]): A list of messages to send to the chat API.
+            max_tokens (int): The maximum number of tokens to generate.
+            stream (bool): Whether to stream the response or wait for the completion.
+            tool_choice (str): The tool choice to use for the completion.
+            temperature (float): The sampling temperature to use for the completion.
+
+        Returns:
+            ChatCompletion: The completion response from the chat API.
+        """
+
+        self.add_tool(
+            func=self._simple_message,
+            func_description="This function will respond to the user question.",
+        )
+
+        output = self.chat.completions.create(
+            model = model,
+            messages = messages,
+            tools = NOT_GIVEN if tool_choice == NOT_GIVEN else self._tools_list,
+            tool_choice = "any",
+            temperature = temperature,
+        )
+
+        messages.append(output.choices[0].message)
+
+        log.debug(output.choices[0].message)
+
+        tool_call = output.choices[0].message.tool_calls[0]
+        function_name = tool_call.function.name
+        function_params = json.loads(tool_call.function.arguments)
+
+        log.debug("\nfunction_name: " + str(function_name) + "\nfunction_params: " + str(function_params))
+
+        if function_name.startswith(self._GHOSTED_FUNC_PREFIX):
+
+            messages.append({
+                "role":"system",
+                "content":"The tool : " + function_name + " is not available.",
+            })
+
+        elif function_name == self._simple_message.__name__:
+
+            return self._simple_message(
+                model = model,
+                messages = messages,
+                max_tokens = max_tokens,
+                temperature = temperature
+            )
+
+        else:
+
+            function_result = self._names_to_functions[function_name](**function_params)
+
+            messages.append({
+                "role":"tool",
+                "name":function_name,
+                "content":str(function_result),
+                "tool_call_id":tool_call.id
+            })
+
+            log.debug("Tool call result :")
+            log.debug(function_result)
+
+        output = self.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=stream
+        )
+
+        return output
 
 
     def send_message(
@@ -81,77 +245,38 @@ class Misster(OpenAI):
         stream: bool = False,
         tool_choice=NOT_GIVEN,
         temperature=0.8,
-        save_context: bool = False,
     ) -> tuple[Union[str, Any], ChatCompletion]:
 
-        start = time.time()
+        start: float = time.time()
         
-        output = self.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=NOT_GIVEN if tool_choice == NOT_GIVEN else self._tools_list,
-            tool_choice="any",
-            stream=stream,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        output: ChatCompletion
 
-        messages.append(output.choices[0].message)
-        
-        # log.info("Response: ")
-        # log.info(output.choices[0].message)
-        
-        if output.choices[0].message.tool_calls:
+        if tool_choice == NOT_GIVEN:
 
-            log.debug(output.choices[0].message)
-
-            log.info("Tool call detected in response.")
-
-            tool_call = output.choices[0].message.tool_calls[0]
-            function_name = tool_call.function.name
-            function_params = json.loads(tool_call.function.arguments)
-            log.info("\nfunction_name: " + str(function_name) + "\nfunction_params: " + str(function_params))
-
-            if function_name.startswith(self._GHOSTED_FUNC_PREFIX):
-
-                messages.append({
-                    "role":"system",
-                    "content":"This tool is not available.",
-                })
-
-            else:
-
-                function_result = self._names_to_functions[function_name](**function_params)
-
-                messages.append({
-                    "role":"tool",
-                    "name":function_name,
-                    "content":str(function_result),
-                    "tool_call_id":tool_call.id
-                })
-
-                log.debug("Tool call result :")
-                log.debug(function_result)
-
-            output = self.chat.completions.create(
+            output = self._simple_message(
                 model=model,
                 messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                stream=stream,
+                temperature=temperature
             )
 
-            messages.append(output.choices[0].message)
-            
-            if not save_context:
-                messages.pop()
-                messages.pop()
+        else:
+
+            output = self._tool_message(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                stream=stream,
+                tool_choice=tool_choice,
+                temperature=temperature
+            )
+
+        messages.append(output.choices[0].message)
 
         end = time.time()
-        
-        if not save_context:
-            messages.pop()
-        
-        log.info(f"Time taken: {end - start} seconds")
+
+        log.debug(f"Time taken: {end - start} seconds")
 
         return (None, output) if stream else (output.choices[0].message.content, output)
 
@@ -314,7 +439,16 @@ class Misster(OpenAI):
 
 
     def tool_partial(self, partial: functools.partial) -> bool:
+        """
+        Returns a new partial object which when called will behave like partial called with the positional arguments args and keyword arguments keywords.
         
+        Args:
+            partial (functools.partial): The partial object to be added as a tool.
+        
+        Returns:
+            bool: True if the tool is successfully added, False if the tool already exists.
+        """
+
         func_name: str = partial.func.__name__
 
         if func_name in self._names_to_functions:
@@ -322,7 +456,7 @@ class Misster(OpenAI):
             return False
 
         self._names_to_functions[func_name] = partial
-        
+
         for tool in self._tools_list:
             if tool["function"]["name"] == self._GHOSTED_FUNC_PREFIX + func_name:
                 tool["function"]["name"] = func_name
@@ -342,109 +476,10 @@ class Misster(OpenAI):
             if tool["function"]["name"] == tool_name:
 
                 self._tools_list.remove(tool)
-                
+
                 if tool_name in self._names_to_functions:
                     del self._names_to_functions[tool_name]
 
                 return True
 
         return False
-
-
-    @property
-    def _context(
-        self,
-    ) -> str:
-        return None
-
-
-### TEST MISSTER
-
-
-MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
-
-MISTRAL_AI_API_KEY = os.getenv("MISTRAL_AI_API_KEY")
-
-messages = [
-    {
-        "role":"user",
-        "content":"1 +1"
-    }
-]
-
-def add(a: int, b: int) -> int:
-
-    return a + b
-
-
-def add_array_to_number(a: list[int], b: int) -> list[int]:
-
-    return [x + b for x in a]
-
-
-def get_data(id: int, db):
-
-    log.info(f"Getting data from database from id {id} in database {db}")
-    return
-
-def respond_to_user() -> str:
-    
-        return "Assistant said"
-
-def test_misster():
-
-    misster = Misster(
-        base_url=MISTRAL_BASE_URL,
-        api_key=MISTRAL_AI_API_KEY,
-    )
-    
-    misster._role = "You are a helpful assistant that can perform various tasks."
-    
-    misster.add_tool(
-        func=respond_to_user,
-        func_description="Respond to a user message",
-    )
-
-    misster.add_tool(
-        func=add,
-        func_description="Add two numbers",
-        params_description={
-            "a": "First number.",
-            "b": "Second number."
-        }
-    )
-
-    misster.add_tool(
-        func=add_array_to_number,
-        func_description="Add a number to each element of an array",
-        params_description={
-            "a": ["Array of numbers.", "a number"],
-            "b": "Number to add to each element."
-        }
-    )
-
-    misster.add_tool(
-        func=get_data,
-        func_description="Get data from database",
-        params_description={
-            "id": "The id of the data to retrieve."
-        }
-    )
-
-    misster.tool_partial(functools.partial(get_data, db="database"))
-
-    log.info(misster._context)
-
-    response, output = misster.send_message(
-        model="mistral-large-latest",
-        messages=messages,
-        max_tokens=60,
-        tool_choice="auto"
-    )
-    
-    log.info("Response:")
-    log.info(response)
-
-
-if __name__ == '__main__':
-    test_misster()

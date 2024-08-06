@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 misster-env/
-misster.env
+*.env
 
 # C extensions
 *.so
