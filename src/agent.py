@@ -82,6 +82,11 @@ class Agent(OpenAI):
             _strict_response_validation=_strict_response_validation,
         )
         
+        self.add_tool(
+            func=self._simple_message,
+            func_description="This function will respond to the user question. no argument needed",
+        )
+        
         return None
 
 
@@ -137,10 +142,12 @@ class Agent(OpenAI):
         Returns:
             ChatCompletion: The completion response from the chat API.
         """
+        
+        log.debug(self._context + messages)
 
         return self.chat.completions.create(
             model=model,
-            messages=messages,
+            messages= self._context + messages,
             stream=stream,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -172,20 +179,13 @@ class Agent(OpenAI):
             ChatCompletion: The completion response from the chat API.
         """
 
-        self.add_tool(
-            func=self._simple_message,
-            func_description="This function will respond to the user question.",
-        )
-
         output = self.chat.completions.create(
             model = model,
-            messages = messages,
+            messages = self._context + messages,
             tools = NOT_GIVEN if tool_choice == NOT_GIVEN else self._tools_list,
             tool_choice = "any",
             temperature = temperature,
         )
-
-        messages.append(output.choices[0].message)
 
         log.debug(output.choices[0].message)
 
@@ -194,15 +194,8 @@ class Agent(OpenAI):
         function_params = json.loads(tool_call.function.arguments)
 
         log.debug("\nfunction_name: " + str(function_name) + "\nfunction_params: " + str(function_params))
-
-        if function_name.startswith(self._GHOSTED_FUNC_PREFIX):
-
-            messages.append({
-                "role":"system",
-                "content":"The tool : " + function_name + " is not available.",
-            })
-
-        elif function_name == self._simple_message.__name__:
+        
+        if function_name == self._simple_message.__name__:
 
             return self._simple_message(
                 model = model,
@@ -210,6 +203,15 @@ class Agent(OpenAI):
                 max_tokens = max_tokens,
                 temperature = temperature
             )
+
+        messages.append(output.choices[0].message)
+
+        if function_name.startswith(self._GHOSTED_FUNC_PREFIX):
+
+            messages.append({
+                "role":"system",
+                "content":"The tool : " + function_name + " is not available.",
+            })
 
         else:
 
@@ -426,9 +428,16 @@ class Agent(OpenAI):
         })
 
         if len(func_params) == len(params_description):
+
             self._names_to_functions[func.__name__] = functools.partial(func)
             log.info(f"Tool '{func.__name__}' added successfully.")
+
+        elif func.__name__ == self._simple_message.__name__:
+
+            log.debug(f"Exceptional function passed : {self._simple_message.__name__}.")
+
         else:
+
             # ghost func.__name__
             self._tools_list[-1]["function"]["name"] = self._GHOSTED_FUNC_PREFIX + func.__name__
             log.debug(f"Function '{func.__name__}' has a different number of parameters than the description. You should add them manually.")
@@ -483,3 +492,58 @@ class Agent(OpenAI):
                 return True
 
         return False
+
+
+import os
+
+
+def main():
+
+    misster = Agent(
+        name="Misster",
+        role="assistant",
+        goal="chat with the user",
+        backstory="I am a helpful assistant that can perform various tasks.",
+        base_url="https://api.mistral.ai/v1",
+        api_key=os.getenv("MISTRAL_AI_API_KEY")
+    )
+
+    misster._role = "You are a helpful assistant that can perform various tasks."
+    
+    user_input: str = ""
+    messages: list[dict[str, str]] = []
+    
+    while user_input != "exit":
+
+        user_input = input("You: ")
+        
+        if user_input == "quit":
+            log.info("Exiting...")
+            break
+
+        messages.append(
+            {
+                "role": "user",
+                "content": user_input
+            }
+        )
+
+        response, output = misster.send_message(
+            model="mistral-large-latest",
+            messages=messages,
+            tool_choice="any",
+            max_tokens=300,
+            temperature=1.3
+        )
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": response.__str__()
+            }
+        )
+
+        print(f"Assistant: {response}")
+
+if __name__ == '__main__':
+    main()
